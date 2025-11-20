@@ -9,5 +9,5 @@ _C.*
 outputs/*
 checkpoints/*.pt
 demo/backend/checkpoints/*.pt
-notebooks/test/*
-notebooks/test_labels/*
+notebooks/videos/test/*
+notebooks/videos/test_labels/*
