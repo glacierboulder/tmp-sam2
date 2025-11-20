@@ -1026,6 +1026,7 @@ class SAM2VideoPredictorVOS(SAM2VideoPredictor):
                 backbone_out["backbone_fpn"][1]
             )
         # Clone to help torch.compile
+        # 原始张量（用于编译）保持不变，而副本可以安全地用于后续计算。
         for i in range(len(backbone_out["backbone_fpn"])):
             backbone_out["backbone_fpn"][i] = backbone_out["backbone_fpn"][i].clone()
             backbone_out["vision_pos_enc"][i] = backbone_out["vision_pos_enc"][
@@ -1091,6 +1092,10 @@ class SAM2VideoPredictorVOS(SAM2VideoPredictor):
         sparse_embeddings = sparse_embeddings.clone()
         dense_embeddings = dense_embeddings.clone()
         image_pe = self.sam_prompt_encoder.get_dense_pe().clone()
+        # low_res_multimasks - 低分辨率掩码预测
+        # ious - 交集比（IoU）估计
+        # object_score_logits - 对象出现的置信度
+        # sam_output_tokens - SAM 的输出令牌
         (
             low_res_multimasks,
             ious,
@@ -1149,15 +1154,22 @@ class SAM2VideoPredictorVOS(SAM2VideoPredictor):
         obj_ptr = self.obj_ptr_proj(sam_output_token)
         if self.pred_obj_scores:
             # Allow *soft* no obj ptr, unlike for masks
-            if self.soft_no_obj_ptr:
+            if self.soft_no_obj_ptr: # 决定是用软性概率（0~1）还是硬性判断（0/1）
                 lambda_is_obj_appearing = object_score_logits.sigmoid()
             else:
                 lambda_is_obj_appearing = is_obj_appearing.float()
 
-            if self.fixed_no_obj_ptr:
+            if self.fixed_no_obj_ptr: # self.fixed_no_obj_ptr 为真时，削弱 or 排除原本 obj_ptr 的数值
                 obj_ptr = lambda_is_obj_appearing * obj_ptr
             obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
 
+        # low_res_multimasks - 低分辨率多掩码
+        # high_res_multimasks - 高分辨率多掩码
+        # ious - IoU 估计
+        # low_res_masks - 低分辨率最佳掩码
+        # high_res_masks - 高分辨率最佳掩码
+        # obj_ptr - 物体指针（用于内存）
+        # object_score_logits - 对象置信度分数
         return (
             low_res_multimasks,
             high_res_multimasks,
@@ -1204,6 +1216,7 @@ class SAM2VideoPredictorVOS(SAM2VideoPredictor):
             mask_for_mem = mask_for_mem * self.sigmoid_scale_for_mem_enc
         if self.sigmoid_bias_for_mem_enc != 0.0:
             mask_for_mem = mask_for_mem + self.sigmoid_bias_for_mem_enc
+        # 调用mask_encoderd的forward方法
         maskmem_out = self.memory_encoder(
             pix_feat, mask_for_mem, skip_mask_sigmoid=True  # sigmoid already applied
         )

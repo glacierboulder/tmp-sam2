@@ -2,15 +2,15 @@
 
 # Model
 model:
-  _target_: sam2.modeling.sam2_base.SAM2Base
+  _target_: sam2.modeling.sam2_base.SAM2Base # 类的路径
   image_encoder:
     _target_: sam2.modeling.backbones.image_encoder.ImageEncoder
     scalp: 1
     trunk:
       _target_: sam2.modeling.backbones.hieradet.Hiera
-      embed_dim: 144
-      num_heads: 2
-      stages: [2, 6, 36, 4]
+      embed_dim: 144 # 嵌入的维度数
+      num_heads: 2 # 注意力头的数量
+      stages: [2, 6, 36, 4] # Hiera 的各个stage中Transformer块数量
       global_att_blocks: [23, 33, 43]
       window_pos_embed_bkg_spatial_size: [7, 7]
       window_spec: [8, 4, 16, 8]
@@ -29,7 +29,7 @@ model:
 
   memory_attention:
     _target_: sam2.modeling.memory_attention.MemoryAttention
-    d_model: 256
+    d_model: 256 # 模型的维度
     pos_enc_at_input: true
     layer:
       _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
@@ -58,18 +58,18 @@ model:
         downsample_rate: 1
         dropout: 0.1
         kv_in_dim: 64
-    num_layers: 4
+    num_layers: 4 # 注意力层数
 
   memory_encoder:
       _target_: sam2.modeling.memory_encoder.MemoryEncoder
       out_dim: 64
-      position_encoding:
+      position_encoding: # 位置编码器
         _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
         num_pos_feats: 64
         normalize: true
         scale: null
         temperature: 10000
-      mask_downsampler:
+      mask_downsampler: # 掩码下采样器
         _target_: sam2.modeling.memory_encoder.MaskDownSampler
         kernel_size: 3
         stride: 2
@@ -85,8 +85,8 @@ model:
           use_dwconv: True  # depth-wise convs
         num_layers: 2
 
-  num_maskmem: 7
-  image_size: 1024
+  num_maskmem: 7 # 记忆掩码的数量！
+  image_size: 1024 # 输入图像的尺寸
   # apply scaled sigmoid on mask logits for memory encoder, and directly feed input mask as output mask
   sigmoid_scale_for_mem_enc: 20.0
   sigmoid_bias_for_mem_enc: -10.0

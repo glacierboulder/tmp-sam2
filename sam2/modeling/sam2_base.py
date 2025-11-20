@@ -58,6 +58,7 @@ class SAM2Base(torch.nn.Module):
         # The memory bank's temporal stride during evaluation (i.e. the `r` parameter in XMem and Cutie; XMem and Cutie use r=5).
         # For r>1, the (self.num_maskmem - 1) non-conditioning memory frames consist of
         # (self.num_maskmem - 2) nearest frames from every r-th frames, plus the last frame.
+        # 选取记忆帧的时间步长
         memory_temporal_stride_for_eval=1,
         # whether to apply non-overlapping constraints on the object masks in the memory encoder during evaluation (to avoid/alleviate superposing masks)
         non_overlap_masks_for_mem_enc=False,
@@ -494,26 +495,31 @@ class SAM2Base(torch.nn.Module):
 
         return backbone_out, vision_feats, vision_pos_embeds, feat_sizes
 
+    # TODO: 考虑怎么修改这个函数来：
+    # 1. 添加双向记忆？
+    # 2. 添加层级式的记忆？
+    # 3. coarse to fine，coarse用全局注意力提取轮廓，fine用相邻的特征。问题：如果CT切片太多，是否会导致效率低？volume attention？
+    # 或许也可以考虑直接修改数据的输入方式？
     def _prepare_memory_conditioned_features(
         self,
-        frame_idx,
-        is_init_cond_frame,
-        current_vision_feats,
-        current_vision_pos_embeds,
-        feat_sizes,
-        output_dict,
-        num_frames,
-        track_in_reverse=False,  # tracking in reverse time order (for demo usage)
+        frame_idx,                  # 当前帧索引
+        is_init_cond_frame,         # 是否为初始条件帧
+        current_vision_feats,       # 当前视觉特征
+        current_vision_pos_embeds,  # 当前视觉位置嵌入
+        feat_sizes,                 # 特征尺寸
+        output_dict,                # 输出字典
+        num_frames,                 # 记忆帧的数量
+        track_in_reverse=False,     # tracking in reverse time order (for demo usage)
     ):
         """Fuse the current frame's visual feature map with previous memory."""
-        B = current_vision_feats[-1].size(1)  # batch size on this frame
-        C = self.hidden_dim
+        B = current_vision_feats[-1].size(1)  # batch size on this frame. [-1] 表示最深层的特征
+        C = self.hidden_dim # 网络内部隐藏层的维度吧
         H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
         device = current_vision_feats[-1].device
         # The case of `self.num_maskmem == 0` below is primarily used for reproducing SAM on images.
         # In this case, we skip the fusion with any memory.
         if self.num_maskmem == 0:  # Disable memory and skip fusion
-            pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
+            pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)   # （H*W，B，C）变为（B, C, H, W）
             return pix_feat
 
         num_obj_ptr_tokens = 0
@@ -524,18 +530,20 @@ class SAM2Base(torch.nn.Module):
             to_cat_memory, to_cat_memory_pos_embed = [], []
             # Add conditioning frames's output first (all cond frames have t_pos=0 for
             # when getting temporal positional embedding below)
+            # NOTE：挑出条件帧。必须存在从用户标注的帧输出的特征？还是说没有条件时填充？
             assert len(output_dict["cond_frame_outputs"]) > 0
             # Select a maximum number of temporally closest cond frames for cross attention
             cond_outputs = output_dict["cond_frame_outputs"]
             selected_cond_outputs, unselected_cond_outputs = select_closest_cond_frames(
                 frame_idx, cond_outputs, self.max_cond_frames_in_attn
-            )
-            t_pos_and_prevs = [(0, out) for out in selected_cond_outputs.values()]
+            ) # 选择条件帧，存在最大数量
+            t_pos_and_prevs = [(0, out) for out in selected_cond_outputs.values()] # 时间位置的标记，（0，out）意思是把所有标记帧的时间记为0
             # Add last (self.num_maskmem - 1) frames before current frame for non-conditioning memory
             # the earliest one has t_pos=1 and the latest one has t_pos=self.num_maskmem-1
             # We also allow taking the memory frame non-consecutively (with stride>1), in which case
             # we take (self.num_maskmem - 2) frames among every stride-th frames plus the last frame.
-            stride = 1 if self.training else self.memory_temporal_stride_for_eval
+            # NOTE：挑出非条件帧，训练时是前r-1帧。
+            stride = 1 if self.training else self.memory_temporal_stride_for_eval # 训练时固定步长为1
             for t_pos in range(1, self.num_maskmem):
                 t_rel = self.num_maskmem - t_pos  # how many frames before current frame
                 if t_rel == 1:
@@ -560,34 +568,38 @@ class SAM2Base(torch.nn.Module):
                         prev_frame_idx = -(-(frame_idx + 2) // stride) * stride
                         # then seek further among every r-th frames
                         prev_frame_idx = prev_frame_idx + (t_rel - 2) * stride
-                out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
+                out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None) # 从未被标记的帧中选择
                 if out is None:
                     # If an unselected conditioning frame is among the last (self.num_maskmem - 1)
                     # frames, we still attend to it as if it's a non-conditioning frame.
+                    # 翻译：如果是标记帧也照样选上
                     out = unselected_cond_outputs.get(prev_frame_idx, None)
-                t_pos_and_prevs.append((t_pos, out))
+                t_pos_and_prevs.append((t_pos, out)) # 把各个帧的时间位置和特征放一起
 
-            for t_pos, prev in t_pos_and_prevs:
+            # NOTE：t_pos_and_prevs内部结构是[(时间位置，特征), (时间位置，特征), ...]。这一步是叠加位置编码
+            for t_pos, prev in t_pos_and_prevs: # t_pos是时间位置，prev是特征
                 if prev is None:
                     continue  # skip padding frames
                 # "maskmem_features" might have been offloaded to CPU in demo use cases,
                 # so we load it back to GPU (it's a no-op if it's already on GPU).
-                feats = prev["maskmem_features"].to(device, non_blocking=True)
-                to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))
+                feats = prev["maskmem_features"].to(device, non_blocking=True) # maskmem是记忆特征
+                to_cat_memory.append(feats.flatten(2).permute(2, 0, 1)) # （B，C，H*W）到（H*W，B，C），拼接到带融合的特征列表
                 # Spatial positional encoding (it might have been offloaded to CPU in eval)
-                maskmem_enc = prev["maskmem_pos_enc"][-1].to(device)
+                maskmem_enc = prev["maskmem_pos_enc"][-1].to(device) # [-1]即取列表末尾最深层的特征
                 maskmem_enc = maskmem_enc.flatten(2).permute(2, 0, 1)
                 # Temporal positional encoding
                 maskmem_enc = (
-                    maskmem_enc + self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1]
+                    maskmem_enc + self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1] # 再附加一层时间位置编码，用于标记与当前帧的距离
                 )
                 to_cat_memory_pos_embed.append(maskmem_enc)
 
             # Construct the list of past object pointers
+            # NOTE，翻译：构建过去的对象指针列表。每帧都有自己的对象指针
             if self.use_obj_ptrs_in_encoder:
-                max_obj_ptrs_in_encoder = min(num_frames, self.max_obj_ptrs_in_encoder)
+                max_obj_ptrs_in_encoder = min(num_frames, self.max_obj_ptrs_in_encoder) # 初始化最大对象指针数量
                 # First add those object pointers from selected conditioning frames
                 # (optionally, only include object pointers in the past during evaluation)
+                # NOTE：在特别设定的情况下只用过去的指针
                 if not self.training and self.only_obj_ptrs_in_the_past_for_eval:
                     ptr_cond_outputs = {
                         t: out
@@ -596,7 +608,7 @@ class SAM2Base(torch.nn.Module):
                     }
                 else:
                     ptr_cond_outputs = selected_cond_outputs
-                pos_and_ptrs = [
+                pos_and_ptrs = [ # 时间-指针对的列表
                     # Temporal pos encoding contains how far away each pointer is from current frame
                     (
                         (
@@ -604,51 +616,57 @@ class SAM2Base(torch.nn.Module):
                             if self.use_signed_tpos_enc_to_obj_ptrs
                             else abs(frame_idx - t)
                         ),
-                        out["obj_ptr"],
+                        out["obj_ptr"], # 对象指针是掩膜解码器的输出之一，包含在out内
                     )
-                    for t, out in ptr_cond_outputs.items()
+                    for t, out in ptr_cond_outputs.items() # ptr_cond_outputs来自已选的标记镇特征
                 ]
                 # Add up to (max_obj_ptrs_in_encoder - 1) non-conditioning frames before current frame
+                # NOTE：查找未标记帧的obj_ptr
                 for t_diff in range(1, max_obj_ptrs_in_encoder):
-                    t = frame_idx + t_diff if track_in_reverse else frame_idx - t_diff
+                    t = frame_idx + t_diff if track_in_reverse else frame_idx - t_diff # 此处t是帧在视频中的序号
                     if t < 0 or (num_frames is not None and t >= num_frames):
-                        break
+                        break # 序号t超出范围
                     out = output_dict["non_cond_frame_outputs"].get(
                         t, unselected_cond_outputs.get(t, None)
-                    )
+                    ) # 先查未标记帧的特征，再查未选择的标记帧的特征。
                     if out is not None:
                         pos_and_ptrs.append((t_diff, out["obj_ptr"]))
                 # If we have at least one object pointer, add them to the across attention
+                # 翻译：只要有对象指针就将其加入交叉注意力
                 if len(pos_and_ptrs) > 0:
-                    pos_list, ptrs_list = zip(*pos_and_ptrs)
+                    pos_list, ptrs_list = zip(*pos_and_ptrs) # “*”是解包操作，而zip是转置，该操作将[(时间, 指针), (时间, 指针), ...]转为([所有时间], [所有指针])
                     # stack object pointers along dim=0 into [ptr_seq_len, B, C] shape
+                    # 翻译：沿着第零个维度堆叠指针，形成 [ptr_seq_len, B, C] 的形状
+                    # C是隐藏层维度。
                     obj_ptrs = torch.stack(ptrs_list, dim=0)
                     # a temporal positional embedding based on how far each object pointer is from
                     # the current frame (sine embedding normalized by the max pointer num).
+                    # NOTE，翻译：叠加一个标记了每个对象指针到当前帧的时间距离的位置编码
                     if self.add_tpos_enc_to_obj_ptrs:
                         t_diff_max = max_obj_ptrs_in_encoder - 1
-                        tpos_dim = C if self.proj_tpos_enc_in_obj_ptrs else self.mem_dim
+                        tpos_dim = C if self.proj_tpos_enc_in_obj_ptrs else self.mem_dim # 位置编码的维度，proj_tpos_enc_in_obj_ptrs添加一次额外的线性映射来与空间位置编码防止潜在的干涉
                         obj_pos = torch.tensor(pos_list).to(
                             device=device, non_blocking=True
                         )
-                        obj_pos = get_1d_sine_pe(obj_pos / t_diff_max, dim=tpos_dim)
+                        obj_pos = get_1d_sine_pe(obj_pos / t_diff_max, dim=tpos_dim) # 生成一维正弦位置编码
                         obj_pos = self.obj_ptr_tpos_proj(obj_pos)
-                        obj_pos = obj_pos.unsqueeze(1).expand(-1, B, self.mem_dim)
+                        obj_pos = obj_pos.unsqueeze(1).expand(-1, B, self.mem_dim) #拓展成（tpos_dim，B，self.mem_dim）的大小？
                     else:
                         obj_pos = obj_ptrs.new_zeros(len(pos_list), B, self.mem_dim)
-                    if self.mem_dim < C:
+                    if self.mem_dim < C: # 维度匹配
                         # split a pointer into (C // self.mem_dim) tokens for self.mem_dim < C
+                        # “//” 是整除
                         obj_ptrs = obj_ptrs.reshape(
                             -1, B, C // self.mem_dim, self.mem_dim
                         )
                         obj_ptrs = obj_ptrs.permute(0, 2, 1, 3).flatten(0, 1)
-                        obj_pos = obj_pos.repeat_interleave(C // self.mem_dim, dim=0)
-                    to_cat_memory.append(obj_ptrs)
+                        obj_pos = obj_pos.repeat_interleave(C // self.mem_dim, dim=0) # 第0个维度重复 C // self.mem_dim 次
+                    to_cat_memory.append(obj_ptrs) # 添加对象指针
                     to_cat_memory_pos_embed.append(obj_pos)
                     num_obj_ptr_tokens = obj_ptrs.shape[0]
                 else:
                     num_obj_ptr_tokens = 0
-        else:
+        else: # 初始条件帧
             # for initial conditioning frames, encode them without using any previous memory
             if self.directly_add_no_mem_embed:
                 # directly add no-mem embedding (instead of using the transformer encoder)
@@ -663,7 +681,8 @@ class SAM2Base(torch.nn.Module):
         # Step 2: Concatenate the memories and forward through the transformer encoder
         memory = torch.cat(to_cat_memory, dim=0)
         memory_pos_embed = torch.cat(to_cat_memory_pos_embed, dim=0)
-
+        
+        # NOTE：调用记忆力操作
         pix_feat_with_mem = self.memory_attention(
             curr=current_vision_feats,
             curr_pos=current_vision_pos_embeds,
